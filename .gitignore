@@ -1,0 +1,7 @@
+# data never committed here (raw positions, events, agency files, GTFS)
+*.csv
+*.csv.gz
+*.parquet
+*.zip
+*.json
+__pycache__/
