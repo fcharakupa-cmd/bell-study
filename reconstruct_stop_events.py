@@ -33,7 +33,7 @@ ET = ZoneInfo("America/New_York")
 GTFS_CANDIDATES = ["MBTA_GTFS.zip", "MBTA_GTFS_archive_20260821.zip"]
 ROUTES = {"1", "52"}
 MAX_GAP_S, BACK_TOL_M, OFF_SHAPE_M, DEPART_OFFSET_M = 90.0, 50.0, 60.0, 15.0
-ANCHOR_STOPS = {"102", "72"}
+ANCHOR_STOPS = {"102", "72", "85371", "84921"}   # Arm A (Route 1) + Arm B (Route 52, Oak Hill)
 
 # ---------------------------------------------------------------------------------------------- GTFS
 class Feed:

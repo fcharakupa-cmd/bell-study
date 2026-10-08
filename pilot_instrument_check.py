@@ -33,7 +33,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 HERE = os.path.dirname(os.path.abspath(__file__))
 EVENTS = r"C:\dev\rel_trackB\events"; RAW = r"C:\dev\rel_trackB\raw"
 METRICS = os.path.join(HERE, "trackB_pilot_metrics")
-ROUTES = {"1", "52"}; ANCHORS = {"102", "72"}
+ROUTES = {"1", "52"}; ANCHORS = {"102", "72", "85371", "84921"}   # Arm A + Arm B (Oak Hill)
 
 def to_epoch(s):
     return (pd.to_datetime(s, utc=True) - pd.Timestamp("1970-01-01", tz="UTC")) / pd.Timedelta(seconds=1)
@@ -92,6 +92,14 @@ def check_day(sd, lamp, feed_trips_active, feed_trip_span):
     out["C1_coverage"] = round(M.captured.mean(), 4) if len(M) else None
     out["C1_anchor"] = {s: {"crossings": int((M.stop_id == s).sum()),
                             "coverage": round(M[M.stop_id == s].captured.mean(), 4) if (M.stop_id == s).any() else None} for s in ANCHORS}
+    # Arm B anchors (85371/84921) are not TransitMaster checkpoints, so the agency record has no actual there. Basis instead:
+    # trips the agency recorded as operated (an actual at any checkpoint) that are planned to serve the stop -> captured there?
+    for s in ANCHORS:
+        if out["C1_anchor"][s]["coverage"] is None:
+            P = lamp[(lamp.service_date == sd) & (lamp.stop_id.astype(str) == s) & lamp.trip_id.isin(set(L.trip_id))][key].drop_duplicates()
+            P = P.merge(good[key + ["event_arrival"]], on=key, how="left") if len(good) else P.assign(event_arrival=np.nan)
+            out["C1_anchor"][s] = {"crossings": int(len(P)), "basis": "operated trips (no checkpoint at stop)",
+                                   "coverage": round(P.event_arrival.notna().mean(), 4) if len(P) else None}
     C = M[M.captured].copy()
     if len(C):
         d_arr = (to_epoch(C.event_arrival) - to_epoch(C.tm_actual_arrival_dt)) / 60
@@ -140,13 +148,14 @@ def main():
     # pooled markdown summary
     lines = ["# Bell Study — pilot instrument check (auto-generated; instrument metrics only)", "",
              f"_Generated {dt.datetime.now().strftime('%Y-%m-%d %H:%M')} · pre-registration §3.3 acceptance_", "",
-             "| Date | C4 sched. trips seen | C1 coverage (checkpoints) | C1 anchors 102 / 72 | C2 bias / SD (min) | C2 within ±1 | C3 OR per 5 min (p) |",
-             "|---|---|---|---|---|---|---|"]
+             "| Date | C4 sched. trips seen | C1 coverage (checkpoints) | C1 anchors 102 / 72 (Arm A) | C1 anchors 85371 / 84921 (Arm B) | C2 bias / SD (min) | C2 within ±1 | C3 OR per 5 min (p) |",
+             "|---|---|---|---|---|---|---|---|"]
     for r in res:
         c2 = r.get("C2", {}); c3 = r.get("C3", {}); an = r.get("C1_anchor", {})
         lines.append(f"| {r['service_date']} | {r['C4_seen_in_raw']}/{r['C4_scheduled_trips_in_span']} | "
                      f"{r.get('C1_coverage', '—') if 'C1_coverage' in r else 'pending'} | "
                      f"{an.get('102', {}).get('coverage', '—')} / {an.get('72', {}).get('coverage', '—')} | "
+                     f"{an.get('85371', {}).get('coverage', '—')} / {an.get('84921', {}).get('coverage', '—')} | "
                      f"{c2.get('arrival_bias_min', '—')} / {c2.get('arrival_sd_min', '—')} | {c2.get('arrival_within_1min', '—')} | "
                      f"{c3.get('odds_ratio_per_5min', '—')} ({c3.get('p_value', '—')}) |")
     lines += ["", "Acceptance (pre-registration §3.3): coverage ≥ 0.97 · |bias| < 0.5 and SD < 0.5 min · capture independent of lateness "

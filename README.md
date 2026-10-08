@@ -1,7 +1,7 @@
 # The Bell Study
 
 **Can a student count on the bus to make first bell — and to get home after dismissal?**
-A pre-registered, GPS-based study of one school trip on MBTA Route 1 (Cambridge, MA), 2026–27 school year.
+A pre-registered, GPS-based study of two school trips — a frequent route (MBTA Route 1, Cambridge, MA) and an infrequent route (MBTA Route 52, Newton, MA) — 2026–27 school year.
 Part of the *Transit Reliability Series* by Faith Charakupa — independent analysis.
 
 > **Status: pilot (instrument shakedown).** No results are computed or published before the baseline. The pre-registration will be
