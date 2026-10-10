@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 from zoneinfo import ZoneInfo
 
-sys.stdout.reconfigure(encoding="utf-8")
+if sys.stdout is not None: sys.stdout.reconfigure(encoding="utf-8")   # pythonw under Task Scheduler has no console
 HERE = os.path.dirname(os.path.abspath(__file__))
 ET = ZoneInfo("America/New_York")
 GTFS_CANDIDATES = ["MBTA_GTFS.zip", "MBTA_GTFS_archive_20260821.zip"]

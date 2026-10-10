@@ -29,7 +29,7 @@ import argparse, datetime as dt, glob, json, os, sys, zipfile, io
 import numpy as np
 import pandas as pd
 
-sys.stdout.reconfigure(encoding="utf-8")
+if sys.stdout is not None: sys.stdout.reconfigure(encoding="utf-8")   # pythonw under Task Scheduler has no console
 HERE = os.path.dirname(os.path.abspath(__file__))
 EVENTS = r"C:\dev\rel_trackB\events"; RAW = r"C:\dev\rel_trackB\raw"
 METRICS = os.path.join(HERE, "trackB_pilot_metrics")
@@ -38,12 +38,24 @@ ROUTES = {"1", "52"}; ANCHORS = {"102", "72", "85371", "84921"}   # Arm A + Arm 
 def to_epoch(s):
     return (pd.to_datetime(s, utc=True) - pd.Timestamp("1970-01-01", tz="UTC")) / pd.Timedelta(seconds=1)
 
+# LAMP timestamps are tz-naive. Verified 2026-10-10 against Track B events (median event - LAMP, 1,188 matched crossings):
+#   tm_actual_*_dt and gtfs_arrival_dt are Eastern local time (+0.3 min read as ET; +240 min if read as UTC);
+#   plan_stop_departure_dt sits one UTC offset EARLIER than Eastern local (a LAMP export quirk): true ET = value - offset.
+def lamp_epoch(s):
+    loc = pd.to_datetime(s).dt.tz_localize("America/New_York", ambiguous="NaT", nonexistent="NaT")
+    return (loc - pd.Timestamp("1970-01-01", tz="UTC")) / pd.Timedelta(seconds=1)
+
+def lamp_plan_epoch(s):
+    loc = pd.to_datetime(s).dt.tz_localize("America/New_York", ambiguous="NaT", nonexistent="NaT")
+    off = loc.map(lambda x: x.utcoffset().total_seconds() if pd.notna(x) else np.nan)   # -14400 in EDT
+    return (loc - pd.Timestamp("1970-01-01", tz="UTC")) / pd.Timedelta(seconds=1) - off
+
 def load_lamp(path, dates):
     """path = the LAMP RECENT parquet, or the per-day history folder written by trackB_lamp_refresh.py."""
     if not path or not os.path.exists(path): return None
     import pyarrow.parquet as pq
     cols = ["service_date", "trip_id", "stop_id", "route_id", "checkpoint_id", "plan_stop_departure_dt",
-            "tm_actual_arrival_dt", "tm_actual_departure_dt", "gtfs_arrival_dt", "vehicle_label"]
+            "tm_actual_arrival_dt", "tm_actual_departure_dt", "gtfs_arrival_dt", "vehicle_label", "stop_sequence"]
     if os.path.isdir(path):
         files = [os.path.join(path, f"lamp_bus_events_{d}.parquet") for d in dates]
         files = [f for f in files if os.path.exists(f)]
@@ -64,6 +76,20 @@ def logistic(x, y):
         if np.abs(step).max() < 1e-8: break
     cov = np.linalg.inv(H + 1e-9 * np.eye(2)); return b[1], np.sqrt(cov[1, 1])
 
+def c2_stats(C):
+    """Timing agreement of Track B events vs TransitMaster actuals (and LAMP's own GTFS-RT time) for a set of crossings."""
+    if not len(C): return None
+    d_arr = (to_epoch(C.event_arrival) - lamp_epoch(C.tm_actual_arrival_dt)) / 60
+    s = {"n": int(len(C)), "arrival_bias_min": round(float(d_arr.mean()), 3), "arrival_sd_min": round(float(d_arr.std()), 3),
+         "arrival_within_1min": round(float((d_arr.abs() <= 1).mean()), 4)}
+    dd = ((to_epoch(C.event_departure) - lamp_epoch(C.tm_actual_departure_dt)) / 60).dropna()
+    if len(dd): s.update({"departure_bias_min": round(float(dd.mean()), 3), "departure_sd_min": round(float(dd.std()), 3)})
+    g = C[C.gtfs_arrival_dt.notna()]
+    if len(g):
+        dg = (to_epoch(g.event_arrival) - lamp_epoch(g.gtfs_arrival_dt)) / 60
+        s["same_feed_vs_LAMP_stopped_at"] = {"n": int(len(g)), "bias_min": round(float(dg.mean()), 3), "sd_min": round(float(dg.std()), 3)}
+    return s
+
 def check_day(sd, lamp, feed_trips_active, feed_trip_span):
     out = {"service_date": sd}
     ev_path = os.path.join(EVENTS, f"stop_events_{sd}.csv")
@@ -83,13 +109,22 @@ def check_day(sd, lamp, feed_trips_active, feed_trip_span):
     # restrict to the stretch of the day Track B was collecting (collector start/stop), so pre-start trips aren't "misses"
     if len(raw):
         t_raw = to_epoch(raw.updated_at); lo, hi = t_raw.min(), t_raw.max()
-        L["ta"] = to_epoch(L.tm_actual_arrival_dt); L = L[(L.ta >= lo + 120) & (L.ta <= hi - 120)]
+        L["ta"] = lamp_epoch(L.tm_actual_arrival_dt); L = L[(L.ta >= lo + 120) & (L.ta <= hi - 120)]
     good = ev[ev.method.isin(["stopped_at", "interpolated"])].copy() if len(ev) else ev
     key = ["trip_id", "stop_id"]
     M = L.merge(good[key + ["event_arrival", "event_departure", "method"]], on=key, how="left")
     M["captured"] = M.event_arrival.notna()
-    out["C1_agency_crossings"] = int(len(M)); out["C1_captured"] = int(M.captured.sum())
-    out["C1_coverage"] = round(M.captured.mean(), 4) if len(M) else None
+    # Acceptance scope (pre-registration §3.3, set 2026-10-10): anchor stops + mid-route checkpoints; each trip's first and last
+    # stop (layover at the origin; the trip ends on arrival at the terminus) are reported separately, not used for acceptance.
+    D = lamp[lamp.service_date == sd].copy(); D["seq"] = pd.to_numeric(D.stop_sequence, errors="coerce")
+    ends = D.groupby("trip_id").seq.agg(["min", "max"])
+    M["seq"] = pd.to_numeric(M.stop_sequence, errors="coerce")
+    M = M.join(ends, on="trip_id"); M["trip_end"] = (M.seq == M["min"]) | (M.seq == M["max"])
+    mid, tend = M[~M.trip_end], M[M.trip_end]
+    out["C1_agency_crossings"] = int(len(mid)); out["C1_captured"] = int(mid.captured.sum())
+    out["C1_coverage"] = round(mid.captured.mean(), 4) if len(mid) else None
+    out["C1_trip_ends_reported_separately"] = {"crossings": int(len(tend)),
+                                               "coverage": round(tend.captured.mean(), 4) if len(tend) else None}
     out["C1_anchor"] = {s: {"crossings": int((M.stop_id == s).sum()),
                             "coverage": round(M[M.stop_id == s].captured.mean(), 4) if (M.stop_id == s).any() else None} for s in ANCHORS}
     # Arm B anchors (85371/84921) are not TransitMaster checkpoints, so the agency record has no actual there. Basis instead:
@@ -100,23 +135,14 @@ def check_day(sd, lamp, feed_trips_active, feed_trip_span):
             P = P.merge(good[key + ["event_arrival"]], on=key, how="left") if len(good) else P.assign(event_arrival=np.nan)
             out["C1_anchor"][s] = {"crossings": int(len(P)), "basis": "operated trips (no checkpoint at stop)",
                                    "coverage": round(P.event_arrival.notna().mean(), 4) if len(P) else None}
-    C = M[M.captured].copy()
-    if len(C):
-        d_arr = (to_epoch(C.event_arrival) - to_epoch(C.tm_actual_arrival_dt)) / 60
-        C2 = {"n": int(len(C)), "arrival_bias_min": round(float(d_arr.mean()), 3), "arrival_sd_min": round(float(d_arr.std()), 3),
-              "arrival_within_1min": round(float((d_arr.abs() <= 1).mean()), 4)}
-        dd = (to_epoch(C.event_departure) - to_epoch(C.tm_actual_departure_dt)) / 60; dd = dd.dropna()
-        if len(dd): C2.update({"departure_bias_min": round(float(dd.mean()), 3), "departure_sd_min": round(float(dd.std()), 3)})
-        g = C[C.gtfs_arrival_dt.notna()]
-        if len(g):
-            dg = (to_epoch(g.event_arrival) - to_epoch(g.gtfs_arrival_dt)) / 60
-            C2["same_feed_vs_LAMP_stopped_at"] = {"n": int(len(g)), "bias_min": round(float(dg.mean()), 3), "sd_min": round(float(dg.std()), 3)}
-        out["C2"] = C2
-    # C3 capture vs agency-recorded lateness (covariate only)
-    dev = (to_epoch(M.tm_actual_arrival_dt) - to_epoch(M.plan_stop_departure_dt)) / 60
+    c2 = c2_stats(mid[mid.captured]);  c2e = c2_stats(tend[tend.captured])
+    if c2: out["C2"] = c2
+    if c2e: out["C2_trip_ends_reported_separately"] = c2e
+    # C3 capture vs agency-recorded lateness (covariate only), on the acceptance scope
+    dev = (lamp_epoch(mid.tm_actual_arrival_dt) - lamp_plan_epoch(mid.plan_stop_departure_dt)) / 60
     ok = dev.notna() & dev.between(-30, 60)
-    if ok.sum() > 30 and M.captured[ok].nunique() == 2:
-        b, se = logistic((dev[ok] / 5).values, M.captured[ok].astype(float).values)
+    if ok.sum() > 30 and mid.captured[ok].nunique() == 2:
+        b, se = logistic((dev[ok] / 5).values, mid.captured[ok].astype(float).values)
         z = b / se; from math import erf, sqrt; p = 2 * (1 - 0.5 * (1 + erf(abs(z) / sqrt(2))))
         out["C3"] = {"n": int(ok.sum()), "odds_ratio_per_5min": round(float(np.exp(b)), 3), "p_value": round(p, 4)}
     elif ok.sum():
@@ -148,7 +174,7 @@ def main():
     # pooled markdown summary
     lines = ["# Bell Study — pilot instrument check (auto-generated; instrument metrics only)", "",
              f"_Generated {dt.datetime.now().strftime('%Y-%m-%d %H:%M')} · pre-registration §3.3 acceptance_", "",
-             "| Date | C4 sched. trips seen | C1 coverage (checkpoints) | C1 anchors 102 / 72 (Arm A) | C1 anchors 85371 / 84921 (Arm B) | C2 bias / SD (min) | C2 within ±1 | C3 OR per 5 min (p) |",
+             "| Date | C4 sched. trips seen | C1 coverage (mid-route checkpoints) | C1 anchors 102 / 72 (Arm A) | C1 anchors 85371 / 84921 (Arm B) | C2 bias / SD (min) | C2 within ±1 | C3 OR per 5 min (p) |",
              "|---|---|---|---|---|---|---|---|"]
     for r in res:
         c2 = r.get("C2", {}); c3 = r.get("C3", {}); an = r.get("C1_anchor", {})
@@ -159,7 +185,8 @@ def main():
                      f"{c2.get('arrival_bias_min', '—')} / {c2.get('arrival_sd_min', '—')} | {c2.get('arrival_within_1min', '—')} | "
                      f"{c3.get('odds_ratio_per_5min', '—')} ({c3.get('p_value', '—')}) |")
     lines += ["", "Acceptance (pre-registration §3.3): coverage ≥ 0.97 · |bias| < 0.5 and SD < 0.5 min · capture independent of lateness "
-              "(p > 0.05, OR 0.8–1.25). C4 is context (dropped trips and collector gaps are not separable without the agency record)."]
+              "(p > 0.05, OR 0.8–1.25), scored at the anchors and mid-route checkpoints; each trip's first/last stop is in the JSON, "
+              "reported separately. C4 is context (dropped trips and collector gaps are not separable without the agency record)."]
     open(os.path.join(METRICS, "INSTRUMENT_CHECK.md"), "w", encoding="utf-8").write("\n".join(lines) + "\n")
     print("Instrument metrics only — no delay/on-time/wait figures are computed during the pilot (pre-registration §2.2).")
 
