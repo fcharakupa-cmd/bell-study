@@ -79,9 +79,16 @@ def logistic(x, y):
 def c2_stats(C):
     """Timing agreement of Track B events vs TransitMaster actuals (and LAMP's own GTFS-RT time) for a set of crossings."""
     if not len(C): return None
-    d_arr = (to_epoch(C.event_arrival) - lamp_epoch(C.tm_actual_arrival_dt)) / 60
-    s = {"n": int(len(C)), "arrival_bias_min": round(float(d_arr.mean()), 3), "arrival_sd_min": round(float(d_arr.std()), 3),
-         "arrival_within_1min": round(float((d_arr.abs() <= 1).mean()), 4)}
+    d_all = (to_epoch(C.event_arrival) - lamp_epoch(C.tm_actual_arrival_dt)) / 60
+    # §3.3 (revised 2026-10-10, D-149): a match more than GROSS_MIN from the agency record is a MATCHING ERROR (two records of
+    # different events), counted against its own limit (<= 0.5% of matches) and listed; bias and SD are computed on the rest.
+    gross = d_all.abs() > GROSS_MIN; d_arr = d_all[~gross]
+    s = {"n": int(len(C)), "matching_errors": int(gross.sum()), "matching_error_rate": round(float(gross.mean()), 4),
+         "matching_error_list": [{"trip_id": str(r.trip_id), "stop_id": str(r.stop_id), "diff_min": round(float(x), 2)}
+                                 for r, x in zip(C[gross].itertuples(), d_all[gross])],
+         "arrival_bias_min": round(float(d_arr.mean()), 3), "arrival_sd_min": round(float(d_arr.std()), 3),
+         "arrival_within_1min": round(float((d_arr.abs() <= 1).mean()), 4),
+         "arrival_sd_min_all_matches": round(float(d_all.std()), 3)}
     dd = ((to_epoch(C.event_departure) - lamp_epoch(C.tm_actual_departure_dt)) / 60).dropna()
     if len(dd): s.update({"departure_bias_min": round(float(dd.mean()), 3), "departure_sd_min": round(float(dd.std()), 3)})
     g = C[C.gtfs_arrival_dt.notna()]
@@ -89,6 +96,20 @@ def c2_stats(C):
         dg = (to_epoch(g.event_arrival) - lamp_epoch(g.gtfs_arrival_dt)) / 60
         s["same_feed_vs_LAMP_stopped_at"] = {"n": int(len(g)), "bias_min": round(float(dg.mean()), 3), "sd_min": round(float(dg.std()), 3)}
     return s
+
+GROSS_MIN = 5.0          # minutes; matching-error threshold (§3.3, revised 2026-10-10)
+POOL = []                # (deviation_min, captured) over all pilot days, for the pooled capture-vs-lateness test
+
+def c3_test(dev, cap):
+    ok = dev.notna() & dev.between(-30, 60)
+    if ok.sum() > 30 and cap[ok].nunique() == 2:
+        b, se = logistic((dev[ok] / 5).values, cap[ok].astype(float).values)
+        z = b / se; from math import erf, sqrt; p = 2 * (1 - 0.5 * (1 + erf(abs(z) / sqrt(2))))
+        lo, hi = np.exp(b - 1.96 * se), np.exp(b + 1.96 * se)
+        return {"n": int(ok.sum()), "odds_ratio_per_5min": round(float(np.exp(b)), 3), "or_95ci": [round(float(lo), 3), round(float(hi), 3)],
+                "p_value": round(p, 4), "miss_rate": round(float(1 - cap[ok].mean()), 4)}
+    return {"n": int(ok.sum()), "note": "all crossings captured (or too few) — no capture/lateness variation to test",
+            "miss_rate": round(float(1 - cap[ok].mean()), 4) if ok.sum() else None}
 
 def check_day(sd, lamp, feed_trips_active, feed_trip_span):
     out = {"service_date": sd}
@@ -140,13 +161,8 @@ def check_day(sd, lamp, feed_trips_active, feed_trip_span):
     if c2e: out["C2_trip_ends_reported_separately"] = c2e
     # C3 capture vs agency-recorded lateness (covariate only), on the acceptance scope
     dev = (lamp_epoch(mid.tm_actual_arrival_dt) - lamp_plan_epoch(mid.plan_stop_departure_dt)) / 60
-    ok = dev.notna() & dev.between(-30, 60)
-    if ok.sum() > 30 and mid.captured[ok].nunique() == 2:
-        b, se = logistic((dev[ok] / 5).values, mid.captured[ok].astype(float).values)
-        z = b / se; from math import erf, sqrt; p = 2 * (1 - 0.5 * (1 + erf(abs(z) / sqrt(2))))
-        out["C3"] = {"n": int(ok.sum()), "odds_ratio_per_5min": round(float(np.exp(b)), 3), "p_value": round(p, 4)}
-    elif ok.sum():
-        out["C3"] = {"n": int(ok.sum()), "note": "all crossings captured (or too few) — no capture/lateness variation to test"}
+    out["C3"] = c3_test(dev, mid.captured)                       # per day: reported; acceptance is POOLED (§3.3, revised 2026-10-10)
+    POOL.extend(zip(dev.tolist(), mid.captured.tolist()))
     return out
 
 def main():
@@ -174,8 +190,8 @@ def main():
     # pooled markdown summary
     lines = ["# Bell Study — pilot instrument check (auto-generated; instrument metrics only)", "",
              f"_Generated {dt.datetime.now().strftime('%Y-%m-%d %H:%M')} · pre-registration §3.3 acceptance_", "",
-             "| Date | C4 sched. trips seen | C1 coverage (mid-route checkpoints) | C1 anchors 102 / 72 (Arm A) | C1 anchors 85371 / 84921 (Arm B) | C2 bias / SD (min) | C2 within ±1 | C3 OR per 5 min (p) |",
-             "|---|---|---|---|---|---|---|---|"]
+             "| Date | C4 sched. trips seen | C1 coverage (mid-route checkpoints) | C1 anchors 102 / 72 (Arm A) | C1 anchors 85371 / 84921 (Arm B) | C2 bias / SD (min) | C2 within ±1 | C2 matching errors | C3 OR per 5 min (p) — per day, context |",
+             "|---|---|---|---|---|---|---|---|---|"]
     for r in res:
         c2 = r.get("C2", {}); c3 = r.get("C3", {}); an = r.get("C1_anchor", {})
         lines.append(f"| {r['service_date']} | {r['C4_seen_in_raw']}/{r['C4_scheduled_trips_in_span']} | "
@@ -183,10 +199,26 @@ def main():
                      f"{an.get('102', {}).get('coverage', '—')} / {an.get('72', {}).get('coverage', '—')} | "
                      f"{an.get('85371', {}).get('coverage', '—')} / {an.get('84921', {}).get('coverage', '—')} | "
                      f"{c2.get('arrival_bias_min', '—')} / {c2.get('arrival_sd_min', '—')} | {c2.get('arrival_within_1min', '—')} | "
+                     f"{c2.get('matching_errors', '—')} ({c2.get('matching_error_rate', '—')}) | "
                      f"{c3.get('odds_ratio_per_5min', '—')} ({c3.get('p_value', '—')}) |")
-    lines += ["", "Acceptance (pre-registration §3.3): coverage ≥ 0.97 · |bias| < 0.5 and SD < 0.5 min · capture independent of lateness "
-              "(p > 0.05, OR 0.8–1.25), scored at the anchors and mid-route checkpoints; each trip's first/last stop is in the JSON, "
-              "reported separately. C4 is context (dropped trips and collector gaps are not separable without the agency record)."]
+    # Pooled acceptance over all pilot days checked (§3.3, revised 2026-10-10, D-149)
+    if POOL:
+        P = pd.DataFrame(POOL, columns=["dev", "cap"]); pc3 = c3_test(P.dev, P.cap)
+        mr = pc3.get("miss_rate")
+        orv = pc3.get("odds_ratio_per_5min"); pv = pc3.get("p_value")
+        pass_a = orv is not None and pv is not None and pv > 0.05 and 0.8 <= orv <= 1.25
+        pass_b = mr is not None and mr <= 0.01
+        n_match = sum(r.get("C2", {}).get("n", 0) for r in res); n_gross = sum(r.get("C2", {}).get("matching_errors", 0) for r in res)
+        lines += ["", f"**Pooled over {len(res)} pilot day(s) (acceptance):** capture vs lateness: odds ratio per 5 min {orv} "
+                  f"(95% CI {pc3.get('or_95ci', '—')}), p = {pv}, miss rate {mr} → "
+                  + ("PASS (a: OR in band, p > 0.05)" if pass_a else ("PASS (b: miss rate ≤ 1% — worst-case effect on any share ≈ "
+                     f"{100*mr:.1f} pts; OR reported)" if pass_b else "NOT MET")) +
+                  f" · matching errors {n_gross} of {n_match} ({100*n_gross/max(1,n_match):.2f}%; limit 0.5%) → "
+                  + ("PASS" if n_gross <= 0.005 * max(1, n_match) else "NOT MET")]
+    lines += ["", "Acceptance (pre-registration §3.3, revised 2026-10-10): coverage ≥ 0.97 · |bias| < 0.5 and SD < 0.5 min on matches within "
+              "5 min of the agency record; matching errors (> 5 min) ≤ 0.5% of matches, each listed · capture vs lateness POOLED over the "
+              "pilot: (a) p > 0.05 and OR 0.8–1.25, or (b) miss rate ≤ 1% (worst-case bound), OR always reported · scored at the anchors and "
+              "mid-route checkpoints; each trip's first/last stop is in the JSON, reported separately. C4 is context."]
     open(os.path.join(METRICS, "INSTRUMENT_CHECK.md"), "w", encoding="utf-8").write("\n".join(lines) + "\n")
     print("Instrument metrics only — no delay/on-time/wait figures are computed during the pilot (pre-registration §2.2).")
 

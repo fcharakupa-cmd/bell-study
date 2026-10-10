@@ -19,7 +19,7 @@ This script outputs EVENTS and INSTRUMENT METRICS ONLY (coverage, method mix, br
 delay, on-time, wait or probability figures: during the pilot the pre-registration forbids computing outcome estimands.
 
 USAGE:  python reconstruct_stop_events.py [--date YYYY-MM-DD ... | --yesterday] [--raw-dir DIR] [--out-dir DIR]
-        (scheduled nightly as task TrackB_Reconstruct, 04:30 CT, with --yesterday)
+        (scheduled nightly as task TrackB_Reconstruct, 05:15 CT, with --yesterday)
 Default: every raw day file present. Output: <out-dir>/stop_events_<date>.csv + <project>/trackB_pilot_metrics/<date>.json
 """
 import argparse, csv, datetime as dt, glob, gzip, io, json, os, sys, zipfile
@@ -122,7 +122,8 @@ def run_day(path, feeds, out_dir, metrics_dir):
     rows, m = [], {"service_date": sd, "gtfs": os.path.basename(feed.path), "raw_reports": int(len(raw)),
                    "trips_observed": 0, "trips_unmatched": 0, "events": {"stopped_at": 0, "interpolated": 0, "missing": 0},
                    "departure": {"interpolated": 0, "coarse": 0, "none": 0}, "bracket_gap_s_p95": None,
-                   "anchor": {s: {"events": 0, "missing": 0} for s in ANCHOR_STOPS}, "offshape_reports": 0}
+                   "anchor": {s: {"events": 0, "missing": 0} for s in ANCHOR_STOPS}, "offshape_reports": 0,
+                   "offshape_by_location": {"near_terminal": 0, "mid_route": 0}, "offshape_mid_route_sample": []}
     gaps = []
     for trip, g in raw.groupby("trip_id"):
         if trip not in feed.trips.index: m["trips_unmatched"] += 1; continue
@@ -134,6 +135,20 @@ def run_day(path, feeds, out_dir, metrics_dir):
         if np.isfinite(along).sum() < 2: continue
         m["trips_observed"] += 1
         stp = feed.st[feed.st.trip_id == trip].sort_values("seq")
+        # Off-shape detector (reporting only; 2026-10-10, external-review follow-up): off-shape reports within 400 m of the trip's
+        # first or last stop are layover/turnaround; mid-route clusters can mean a detour or a vehicle logged into the wrong trip.
+        off = np.where(np.isnan(along))[0]
+        if len(off):
+            ends = feed.stops.loc[[stp.stop_id.iloc[0], stp.stop_id.iloc[-1]], ["stop_lat", "stop_lon"]].values.astype(float)
+            la = g.latitude.astype(float).values[off]; lo = g.longitude.astype(float).values[off]
+            dkm = np.min([np.hypot((la - e[0]) * 111.0, (lo - e[1]) * 111.0 * np.cos(np.radians(e[0]))) for e in ends], axis=0)
+            near = dkm <= 0.4
+            m["offshape_by_location"]["near_terminal"] += int(near.sum()); m["offshape_by_location"]["mid_route"] += int((~near).sum())
+            for k in np.where(~near)[0][:3]:
+                if len(m["offshape_mid_route_sample"]) < 25:
+                    m["offshape_mid_route_sample"].append({"trip_id": str(trip), "vehicle_id": str(veh),
+                        "time": pd.Timestamp(float(times[off[k]]), unit="s", tz="UTC").tz_convert(ET).isoformat(timespec="seconds"),
+                        "lat": round(float(la[k]), 5), "lon": round(float(lo[k]), 5), "km_from_terminal": round(float(dkm[k]), 2)})
         s_al, _ = monotonic_along(*project(geo, feed.stops.loc[stp.stop_id, "stop_lat"].values, feed.stops.loc[stp.stop_id, "stop_lon"].values),
                                   back_tol=5.0, off=200.0)
         status = g.current_status.values; stop_ids = g.stop_id.values
@@ -144,14 +159,18 @@ def run_day(path, feeds, out_dir, metrics_dir):
             if not len(hit) and (not np.isfinite(D) or D < amin or D > amax):
                 m["not_attempted"] = m.get("not_attempted", 0) + 1            # stop outside the observed stretch: not a miss
                 continue
-            arr, dep, method, dep_m, gap = None, None, "missing", "none", None
+            arr, dep, method, dep_m, gap, t_first = None, None, "missing", "none", None, None
             if len(hit):
-                arr = float(times[hit[0]]); method = "stopped_at"
+                # Rule 1 (pre-registration §3.2, revised 2026-10-10, D-149): arrival = the vehicle's last report BEFORE its first
+                # STOPPED_AT at the stop when the two are <= 90 s apart (STOPPED_AT posts ~20 s after the agency's recorded arrival);
+                # otherwise the first STOPPED_AT. The first STOPPED_AT time is kept (column first_stopped_at) for the sensitivity.
+                i0 = hit[0]; t_first = float(times[i0]); arr = t_first; method = "stopped_at"
+                if i0 > 0 and t_first - float(times[i0 - 1]) <= MAX_GAP_S: arr = float(times[i0 - 1])
                 if np.isfinite(D):
-                    dep, g2 = crossing(times, along, D + DEPART_OFFSET_M, after=arr)
+                    dep, g2 = crossing(times, along, D + DEPART_OFFSET_M, after=t_first)
                     if dep is not None: dep_m = "interpolated"
                 if dep is None:
-                    later = np.where((times > arr) & ((stop_ids != s) | (np.nan_to_num(along, nan=-1) > (D if np.isfinite(D) else 1e12) + DEPART_OFFSET_M)))[0]
+                    later = np.where((times > t_first) & ((stop_ids != s) | (np.nan_to_num(along, nan=-1) > (D if np.isfinite(D) else 1e12) + DEPART_OFFSET_M)))[0]
                     if len(later): dep = float(times[later[0]]); dep_m = "coarse"
             else:
                 arr, gap = crossing(times, along, D)
@@ -162,7 +181,7 @@ def run_day(path, feeds, out_dir, metrics_dir):
             if s in ANCHOR_STOPS:
                 m["anchor"][s]["events" if method != "missing" else "missing"] += 1
             rows.append([sd, tr.route_id, trip, veh, tr.direction_id, s, srow.stop_sequence, srow.checkpoint_id if isinstance(srow.checkpoint_id, str) else "",
-                         iso(sch), iso(arr), iso(dep), method, dep_m, "" if gap is None else round(gap, 1)])
+                         iso(sch), iso(arr), iso(dep), method, dep_m, "" if gap is None else round(gap, 1), iso(t_first)])
     m["trips_scheduled_active"] = int(len(sched_trips))
     m["trips_scheduled_seen"] = int(len(set(raw.trip_id) & set(sched_trips.index)))
     if gaps: m["bracket_gap_s_p95"] = round(float(np.percentile(gaps, 95)), 1)
@@ -170,7 +189,7 @@ def run_day(path, feeds, out_dir, metrics_dir):
     with open(os.path.join(out_dir, f"stop_events_{sd}.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["service_date", "route_id", "trip_id", "vehicle_id", "direction_id", "stop_id", "stop_sequence", "checkpoint_id",
-                    "scheduled_arrival", "event_arrival", "event_departure", "method", "departure_method", "bracket_gap_s"])
+                    "scheduled_arrival", "event_arrival", "event_departure", "method", "departure_method", "bracket_gap_s", "first_stopped_at"])
         w.writerows(rows)
     with open(os.path.join(metrics_dir, f"{sd}.json"), "w", encoding="utf-8") as f: json.dump(m, f, indent=1)
     return m
@@ -194,7 +213,7 @@ def main():
             print(f"[{m['service_date']}] {m['gtfs']} | reports {m['raw_reports']:,} | trips observed {m['trips_observed']} "
                   f"(unmatched {m['trips_unmatched']}) | stop events {tot:,}: stopped_at {ev['stopped_at']:,}, interpolated "
                   f"{ev['interpolated']:,}, missing {ev['missing']:,} ({100*ev['missing']/max(1,tot):.1f}%) | departures {m['departure']} "
-                  f"| bracket gap p95 {m['bracket_gap_s_p95']} s | off-shape reports {m['offshape_reports']} | not attempted {m.get('not_attempted',0)} | missing reasons {m.get('missing_reason',{})} | anchors {m['anchor']}")
+                  f"| bracket gap p95 {m['bracket_gap_s_p95']} s | off-shape reports {m['offshape_reports']} {m['offshape_by_location']} | not attempted {m.get('not_attempted',0)} | missing reasons {m.get('missing_reason',{})} | anchors {m['anchor']}")
     print("Instrument metrics only — no delay/on-time/wait figures are computed during the pilot (pre-registration §2.2).")
 
 if __name__ == "__main__":
