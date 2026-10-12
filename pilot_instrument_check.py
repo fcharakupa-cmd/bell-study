@@ -98,7 +98,8 @@ def c2_stats(C):
     return s
 
 GROSS_MIN = 5.0          # minutes; matching-error threshold (§3.3, revised 2026-10-10)
-POOL = []                # (deviation_min, captured) over all pilot days, for the pooled capture-vs-lateness test
+PILOT_START, PILOT_END = "2026-10-08", "2026-10-19"   # §3.3 pooled acceptance span, fixed 2026-10-12 before freezing (Faith; D-157)
+POOL = []                # (deviation_min, captured) over the pilot span only, for the pooled capture-vs-lateness test
 
 def c3_test(dev, cap):
     ok = dev.notna() & dev.between(-30, 60)
@@ -162,7 +163,8 @@ def check_day(sd, lamp, feed_trips_active, feed_trip_span):
     # C3 capture vs agency-recorded lateness (covariate only), on the acceptance scope
     dev = (lamp_epoch(mid.tm_actual_arrival_dt) - lamp_plan_epoch(mid.plan_stop_departure_dt)) / 60
     out["C3"] = c3_test(dev, mid.captured)                       # per day: reported; acceptance is POOLED (§3.3, revised 2026-10-10)
-    POOL.extend(zip(dev.tolist(), mid.captured.tolist()))
+    if PILOT_START <= sd <= PILOT_END:                           # days outside the fixed span are reported, never pooled
+        POOL.extend(zip(dev.tolist(), mid.captured.tolist()))
     return out
 
 def main():
@@ -194,7 +196,8 @@ def main():
              "|---|---|---|---|---|---|---|---|---|"]
     for r in res:
         c2 = r.get("C2", {}); c3 = r.get("C3", {}); an = r.get("C1_anchor", {})
-        lines.append(f"| {r['service_date']} | {r['C4_seen_in_raw']}/{r['C4_scheduled_trips_in_span']} | "
+        tag = "" if PILOT_START <= r["service_date"] <= PILOT_END else " (outside pilot span)"
+        lines.append(f"| {r['service_date']}{tag} | {r['C4_seen_in_raw']}/{r['C4_scheduled_trips_in_span']} | "
                      f"{r.get('C1_coverage', '—') if 'C1_coverage' in r else 'pending'} | "
                      f"{an.get('102', {}).get('coverage', '—')} / {an.get('72', {}).get('coverage', '—')} | "
                      f"{an.get('85371', {}).get('coverage', '—')} / {an.get('84921', {}).get('coverage', '—')} | "
@@ -208,8 +211,11 @@ def main():
         orv = pc3.get("odds_ratio_per_5min"); pv = pc3.get("p_value")
         pass_a = orv is not None and pv is not None and pv > 0.05 and 0.8 <= orv <= 1.25
         pass_b = mr is not None and mr <= 0.01
-        n_match = sum(r.get("C2", {}).get("n", 0) for r in res); n_gross = sum(r.get("C2", {}).get("matching_errors", 0) for r in res)
-        lines += ["", f"**Pooled over {len(res)} pilot day(s) (acceptance):** capture vs lateness: odds ratio per 5 min {orv} "
+        pres = [r for r in res if PILOT_START <= r["service_date"] <= PILOT_END and "C1_coverage" in r]   # days with agency-record checks
+        n_match = sum(r.get("C2", {}).get("n", 0) for r in pres); n_gross = sum(r.get("C2", {}).get("matching_errors", 0) for r in pres)
+        done = max(r["service_date"] for r in pres) >= PILOT_END
+        lines += ["", f"**Pooled over the pilot span {PILOT_START} → {PILOT_END}, {len(pres)} day(s) checked"
+                  + ("" if done else " — PROVISIONAL, span not complete") + f" (acceptance):** capture vs lateness: odds ratio per 5 min {orv} "
                   f"(95% CI {pc3.get('or_95ci', '—')}), p = {pv}, miss rate {mr} → "
                   + ("PASS (a: OR in band, p > 0.05)" if pass_a else ("PASS (b: miss rate ≤ 1% — worst-case effect on any share ≈ "
                      f"{100*mr:.1f} pts; OR reported)" if pass_b else "NOT MET")) +
@@ -217,7 +223,7 @@ def main():
                   + ("PASS" if n_gross <= 0.005 * max(1, n_match) else "NOT MET")]
     lines += ["", "Acceptance (pre-registration §3.3, revised 2026-10-10): coverage ≥ 0.97 · |bias| < 0.5 and SD < 0.5 min on matches within "
               "5 min of the agency record; matching errors (> 5 min) ≤ 0.5% of matches, each listed · capture vs lateness POOLED over the "
-              "pilot: (a) p > 0.05 and OR 0.8–1.25, or (b) miss rate ≤ 1% (worst-case bound), OR always reported · scored at the anchors and "
+              f"fixed pilot span {PILOT_START} → {PILOT_END}: (a) p > 0.05 and OR 0.8–1.25, or (b) miss rate ≤ 1% (worst-case bound), OR always reported · scored at the anchors and "
               "mid-route checkpoints; each trip's first/last stop is in the JSON, reported separately. C4 is context."]
     open(os.path.join(METRICS, "INSTRUMENT_CHECK.md"), "w", encoding="utf-8").write("\n".join(lines) + "\n")
     print("Instrument metrics only — no delay/on-time/wait figures are computed during the pilot (pre-registration §2.2).")
