@@ -240,7 +240,7 @@ def main():
         dep = f"departure bias {Dp.mean():.3f} / SD {Dp.std(ddof=1):.3f} min (n = {len(Dp)}; reported, not used for acceptance)" if len(Dp) > 1 else ""
         lines += ["", "**Pooled coverage (§3.3, scored pooled over the span):** " + " · ".join(cov),
                   "", "**Pooled timing (arrival; Arm B anchors not scored):** " + tim + (" · " + dep if dep else "")]
-    lines += ["", "Acceptance (pre-registration §3.3, revised 2026-10-10): coverage ≥ 0.97 · |bias| < 0.5 and SD < 0.5 min on matches within "
+    lines += ["", "Acceptance (pre-registration §3.3, revised 2026-10-10; every criterion pooled 2026-10-14): coverage ≥ 0.97 · |bias| < 0.5 and SD < 0.5 min on matches within "
               "5 min of the agency record; matching errors (> 5 min) ≤ 0.5% of matches, each listed · capture vs lateness POOLED over the "
               f"fixed pilot span {PILOT_START} → {PILOT_END}: (a) p > 0.05 and OR 0.8–1.25, or (b) miss rate ≤ 1% (worst-case bound), OR always reported · scored at the anchors and "
               "mid-route checkpoints; each trip's first/last stop is in the JSON, reported separately. C4 is context."]
