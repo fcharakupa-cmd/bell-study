@@ -95,11 +95,13 @@ def c2_stats(C):
     if len(g):
         dg = (to_epoch(g.event_arrival) - lamp_epoch(g.gtfs_arrival_dt)) / 60
         s["same_feed_vs_LAMP_stopped_at"] = {"n": int(len(g)), "bias_min": round(float(dg.mean()), 3), "sd_min": round(float(dg.std()), 3)}
+    s["_arr"], s["_dep"] = d_arr.tolist(), dd.tolist()
     return s
 
 GROSS_MIN = 5.0          # minutes; matching-error threshold (§3.3, revised 2026-10-10)
 PILOT_START, PILOT_END = "2026-10-08", "2026-10-19"   # §3.3 pooled acceptance span, fixed 2026-10-12 before freezing (Faith; D-157)
 POOL = []                # (deviation_min, captured) over the pilot span only, for the pooled capture-vs-lateness test
+POOL_ARR, POOL_DEP = [], []   # arrival / departure differences vs the agency record (min), span days only (§3.3 R5, reporting)
 
 def c3_test(dev, cap):
     ok = dev.notna() & dev.between(-30, 60)
@@ -147,7 +149,7 @@ def check_day(sd, lamp, feed_trips_active, feed_trip_span):
     out["C1_coverage"] = round(mid.captured.mean(), 4) if len(mid) else None
     out["C1_trip_ends_reported_separately"] = {"crossings": int(len(tend)),
                                                "coverage": round(tend.captured.mean(), 4) if len(tend) else None}
-    out["C1_anchor"] = {s: {"crossings": int((M.stop_id == s).sum()),
+    out["C1_anchor"] = {s: {"crossings": int((M.stop_id == s).sum()), "captured": int(M[M.stop_id == s].captured.sum()),
                             "coverage": round(M[M.stop_id == s].captured.mean(), 4) if (M.stop_id == s).any() else None} for s in ANCHORS}
     # Arm B anchors (85371/84921) are not TransitMaster checkpoints, so the agency record has no actual there. Basis instead:
     # trips the agency recorded as operated (an actual at any checkpoint) that are planned to serve the stop -> captured there?
@@ -155,11 +157,15 @@ def check_day(sd, lamp, feed_trips_active, feed_trip_span):
         if out["C1_anchor"][s]["coverage"] is None:
             P = lamp[(lamp.service_date == sd) & (lamp.stop_id.astype(str) == s) & lamp.trip_id.isin(set(L.trip_id))][key].drop_duplicates()
             P = P.merge(good[key + ["event_arrival"]], on=key, how="left") if len(good) else P.assign(event_arrival=np.nan)
-            out["C1_anchor"][s] = {"crossings": int(len(P)), "basis": "operated trips (no checkpoint at stop)",
+            out["C1_anchor"][s] = {"crossings": int(len(P)), "captured": int(P.event_arrival.notna().sum()),
+                                   "basis": "operated trips (no checkpoint at stop)",
                                    "coverage": round(P.event_arrival.notna().mean(), 4) if len(P) else None}
     c2 = c2_stats(mid[mid.captured]);  c2e = c2_stats(tend[tend.captured])
-    if c2: out["C2"] = c2
-    if c2e: out["C2_trip_ends_reported_separately"] = c2e
+    if c2:
+        arr, dep = c2.pop("_arr"), c2.pop("_dep"); out["C2"] = c2
+        if PILOT_START <= sd <= PILOT_END: POOL_ARR.extend(arr); POOL_DEP.extend(dep)
+    if c2e:
+        c2e.pop("_arr"); c2e.pop("_dep"); out["C2_trip_ends_reported_separately"] = c2e
     # C3 capture vs agency-recorded lateness (covariate only), on the acceptance scope
     dev = (lamp_epoch(mid.tm_actual_arrival_dt) - lamp_plan_epoch(mid.plan_stop_departure_dt)) / 60
     out["C3"] = c3_test(dev, mid.captured)                       # per day: reported; acceptance is POOLED (§3.3, revised 2026-10-10)
@@ -221,6 +227,19 @@ def main():
                      f"{100*mr:.1f} pts; OR reported)" if pass_b else "NOT MET")) +
                   f" · matching errors {n_gross} of {n_match} ({100*n_gross/max(1,n_match):.2f}%; limit 0.5%) → "
                   + ("PASS" if n_gross <= 0.005 * max(1, n_match) else "NOT MET")]
+        # §3.3 R5 (2026-10-14, before the span closed): every criterion pooled from crossing counts summed over the span's days
+        cx = sum(r.get("C1_agency_crossings", 0) for r in pres); cc = sum(r.get("C1_captured", 0) for r in pres)
+        cov = [f"mid-route {cc}/{cx} = {cc/max(1,cx):.4f} → {'PASS' if cx and cc/cx >= 0.97 else 'NOT MET'}"]
+        for a_ in ANCHORS:
+            ax = sum(r.get("C1_anchor", {}).get(a_, {}).get("crossings", 0) for r in pres)
+            ac = sum(r.get("C1_anchor", {}).get(a_, {}).get("captured", 0) for r in pres)
+            cov.append(f"{a_} {ac}/{ax} = {ac/max(1,ax):.4f} → {'PASS' if ax and ac/ax >= 0.97 else 'NOT MET'}")
+        A = np.array(POOL_ARR, float); Dp = np.array(POOL_DEP, float)
+        tim = (f"arrival bias {A.mean():.3f} / SD {A.std(ddof=1):.3f} min (n = {len(A)}) → "
+               + ("PASS" if abs(A.mean()) < 0.5 and A.std(ddof=1) < 0.5 else "NOT MET")) if len(A) > 1 else "arrival timing —"
+        dep = f"departure bias {Dp.mean():.3f} / SD {Dp.std(ddof=1):.3f} min (n = {len(Dp)}; reported, not used for acceptance)" if len(Dp) > 1 else ""
+        lines += ["", "**Pooled coverage (§3.3, scored pooled over the span):** " + " · ".join(cov),
+                  "", "**Pooled timing (arrival; Arm B anchors not scored):** " + tim + (" · " + dep if dep else "")]
     lines += ["", "Acceptance (pre-registration §3.3, revised 2026-10-10): coverage ≥ 0.97 · |bias| < 0.5 and SD < 0.5 min on matches within "
               "5 min of the agency record; matching errors (> 5 min) ≤ 0.5% of matches, each listed · capture vs lateness POOLED over the "
               f"fixed pilot span {PILOT_START} → {PILOT_END}: (a) p > 0.05 and OR 0.8–1.25, or (b) miss rate ≤ 1% (worst-case bound), OR always reported · scored at the anchors and "
